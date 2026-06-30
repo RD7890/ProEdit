@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ProEdit</string>
+    <string name="import_photo">Import Photo</string>
+    <string name="adjustments">Adjustments</string>
+    <string name="filters">Filters</string>
+    <string name="mask">Mask</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+    <string name="done">Done</string>
+    <string name="reset">Reset</string>
+    <string name="invert">Invert Mask</string>
+    <string name="clear">Clear Mask</string>
+</resources>
