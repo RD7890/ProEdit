@@ -135,10 +135,9 @@ class EditorViewModel : ViewModel() {
                 sharpness   = adj.sharpness,
                 ambiance    = adj.ambiance,
             )
-            _uiState.update { cur ->
-                cur.displayBitmap?.recycle()
-                cur.copy(displayBitmap = working)
-            }
+            // Do NOT recycle the old bitmap immediately — Compose's ImageBitmap may
+            // still hold a reference to it on the render thread. Let GC collect it.
+            _uiState.update { cur -> cur.copy(displayBitmap = working) }
         }
     }
 
@@ -153,10 +152,7 @@ class EditorViewModel : ViewModel() {
             if (filterIndex > 0) {
                 NativeProcessor.applyFilterInPlace(working, filterIndex)
             }
-            _uiState.update { cur ->
-                cur.displayBitmap?.recycle()
-                cur.copy(displayBitmap = working)
-            }
+            _uiState.update { cur -> cur.copy(displayBitmap = working) }
         }
     }
 
@@ -257,10 +253,7 @@ class EditorViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.Default) {
             val pixels  = NativeProcessor.getMaskOverlay(mask, w, h)
             val overlay = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
-            _uiState.update { cur ->
-                cur.overlayBitmap?.recycle()
-                cur.copy(overlayBitmap = overlay)
-            }
+            _uiState.update { cur -> cur.copy(overlayBitmap = overlay) }
         }
     }
 
@@ -302,8 +295,11 @@ class EditorViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        _uiState.value.displayBitmap?.recycle()
-        _uiState.value.originalBitmap?.recycle()
-        _uiState.value.overlayBitmap?.recycle()
+        // Only safe to recycle here — ViewModel is being destroyed, no UI holds references
+        _uiState.value.let { s ->
+            s.displayBitmap?.recycle()
+            s.originalBitmap?.recycle()
+            s.overlayBitmap?.recycle()
+        }
     }
 }

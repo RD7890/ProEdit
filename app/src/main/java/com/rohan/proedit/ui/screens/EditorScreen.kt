@@ -47,10 +47,10 @@ fun EditorScreen(
         return
     }
 
-    // Save confirmation effect
+    // Save confirmation effect — LaunchedEffect must NOT be conditional
     val savedPath = state.savedPath
-    if (savedPath != null) {
-        LaunchedEffect(savedPath) {
+    LaunchedEffect(savedPath) {
+        if (savedPath != null) {
             delay(2500)
             viewModel.clearSaveState()
         }

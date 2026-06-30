@@ -87,6 +87,10 @@ Java_com_rohan_proedit_processing_NativeProcessor_applyAdjustmentsInPlace(
     AndroidBitmapInfo info;
     void* pixels = nullptr;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) { LOGE("getInfo failed"); return; }
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        LOGE("applyAdjustments: unsupported format %d (need RGBA_8888)", info.format);
+        return;
+    }
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) { LOGE("lock failed"); return; }
 
     const int W = (int)info.width;
@@ -208,6 +212,7 @@ Java_com_rohan_proedit_processing_NativeProcessor_applyFilterInPlace(
     AndroidBitmapInfo info;
     void* pixels = nullptr;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) { LOGE("applyFilter: unsupported format %d", info.format); return; }
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
 
     const int W = (int)info.width, H = (int)info.height, stride = (int)info.stride;
