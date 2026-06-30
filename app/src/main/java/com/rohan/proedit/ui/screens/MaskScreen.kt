@@ -98,7 +98,11 @@ fun MaskScreen(viewModel: EditorViewModel) {
                             onDrag = { change, _ ->
                                 val bc = toBitmapCoord(change.position)
                                 viewModel.paintBrush(bc.x, bc.y)
-                            }
+                            },
+                            // Force final overlay render when finger lifts —
+                            // the debounce may not have fired for the last few points
+                            onDragEnd   = { viewModel.commitBrushStroke() },
+                            onDragCancel = { viewModel.commitBrushStroke() },
                         )
                         MaskMode.SMART_BRUSH -> detectTapGestures { off ->
                             val bc = toBitmapCoord(off)

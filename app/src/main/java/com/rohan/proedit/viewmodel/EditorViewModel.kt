@@ -34,22 +34,22 @@ data class AdjustmentState(
 )
 
 data class EditorUiState(
-    val originalBitmap:  Bitmap?          = null,
-    val displayBitmap:   Bitmap?          = null,
-    val overlayBitmap:   Bitmap?          = null, // mask overlay (red)
-    val mask:            ByteArray?       = null,
-    val hasMask:         Boolean          = false,
-    val adjustments:     AdjustmentState  = AdjustmentState(),
-    val activeFilter:    Int              = 0,
-    val activeTab:       EditorTab        = EditorTab.TUNE,
-    val maskMode:        MaskMode         = MaskMode.BRUSH,
-    val brushSize:       Float            = 60f,
-    val brushAdding:     Boolean          = true,
-    val smartTolerance:  Float            = 0.35f,
-    val isProcessing:    Boolean          = false,
-    val isSaving:        Boolean          = false,
-    val saveError:       String?          = null,
-    val savedPath:       String?          = null,
+    val originalBitmap:  Bitmap?         = null,
+    val displayBitmap:   Bitmap?         = null,
+    val overlayBitmap:   Bitmap?         = null,
+    val mask:            ByteArray?      = null,
+    val hasMask:         Boolean         = false,
+    val adjustments:     AdjustmentState = AdjustmentState(),
+    val activeFilter:    Int             = 0,
+    val activeTab:       EditorTab       = EditorTab.TUNE,
+    val maskMode:        MaskMode        = MaskMode.BRUSH,
+    val brushSize:       Float           = 60f,
+    val brushAdding:     Boolean         = true,
+    val smartTolerance:  Float           = 0.35f,
+    val isProcessing:    Boolean         = false,
+    val isSaving:        Boolean         = false,
+    val saveError:       String?         = null,
+    val savedPath:       String?         = null,
 )
 
 class EditorViewModel : ViewModel() {
@@ -57,7 +57,9 @@ class EditorViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
-    private var applyJob: Job? = null
+    private var applyJob:   Job? = null
+    /** Tracked separately so we can cancel before launching a new overlay render. */
+    private var overlayJob: Job? = null
 
     // ── Image loading ─────────────────────────────────────────────────────
 
@@ -74,12 +76,13 @@ class EditorViewModel : ViewModel() {
 
                 if (raw == null) { _uiState.update { it.copy(isProcessing = false) }; return@launch }
 
-                // Downscale if very large (keep within 4096px)
+                // Downscale very large images (keep within 4096 px on longest side)
                 val maxSide = 4096
                 val scaled = if (raw.width > maxSide || raw.height > maxSide) {
                     val scale = maxSide.toFloat() / maxOf(raw.width, raw.height)
-                    Bitmap.createScaledBitmap(raw, (raw.width * scale).toInt(), (raw.height * scale).toInt(), true)
-                        .also { if (it !== raw) raw.recycle() }
+                    Bitmap.createScaledBitmap(
+                        raw, (raw.width * scale).toInt(), (raw.height * scale).toInt(), true
+                    ).also { if (it !== raw) raw.recycle() }
                 } else raw
 
                 val display = scaled.copy(Bitmap.Config.ARGB_8888, true)
@@ -111,13 +114,13 @@ class EditorViewModel : ViewModel() {
     private fun scheduleApply() {
         applyJob?.cancel()
         applyJob = viewModelScope.launch {
-            delay(60) // debounce 60ms
+            delay(60) // debounce 60 ms
             applyAdjustments()
         }
     }
 
     private suspend fun applyAdjustments() {
-        val state = _uiState.value
+        val state    = _uiState.value
         val original = state.originalBitmap ?: return
         val adj      = state.adjustments
 
@@ -125,7 +128,7 @@ class EditorViewModel : ViewModel() {
             val working = original.copy(Bitmap.Config.ARGB_8888, true)
             NativeProcessor.applyAdjustmentsInPlace(
                 bitmap      = working,
-                mask        = if (state.hasMask) state.mask else null,
+                mask        = if (state.hasMask) state.mask?.copyOf() else null,
                 brightness  = adj.brightness,
                 contrast    = adj.contrast,
                 saturation  = adj.saturation,
@@ -136,7 +139,7 @@ class EditorViewModel : ViewModel() {
                 ambiance    = adj.ambiance,
             )
             // Do NOT recycle the old bitmap immediately — Compose's ImageBitmap may
-            // still hold a reference to it on the render thread. Let GC collect it.
+            // still reference it on the render thread. Let GC collect it.
             _uiState.update { cur -> cur.copy(displayBitmap = working) }
         }
     }
@@ -162,13 +165,13 @@ class EditorViewModel : ViewModel() {
         val state    = _uiState.value
         val original = state.originalBitmap ?: return
         val w = original.width; val h = original.height
-
         val mask = state.mask ?: ByteArray(w * h) { 0 }
         _uiState.update { it.copy(mask = mask, activeTab = EditorTab.MASK) }
-        refreshOverlay(mask, w, h)
+        refreshOverlayImmediate(mask, w, h)
     }
 
     fun exitMaskMode(apply: Boolean) {
+        overlayJob?.cancel()
         if (!apply) {
             _uiState.update { it.copy(activeTab = EditorTab.TUNE) }
             return
@@ -177,12 +180,29 @@ class EditorViewModel : ViewModel() {
         scheduleApply()
     }
 
+    /**
+     * Called on every drag point during brush painting.
+     * Paints to the mask synchronously (fast JNI), then schedules a DEBOUNCED overlay
+     * refresh — prevents launching a coroutine per touch event (60+ per second).
+     */
     fun paintBrush(x: Float, y: Float) {
         val state = _uiState.value
         val mask  = state.mask ?: return
         val bmp   = state.originalBitmap ?: return
+        // Write to mask on the calling (main) thread — fast JNI, no coroutine needed
         NativeProcessor.paintMask(mask, bmp.width, bmp.height, x, y, state.brushSize, state.brushAdding)
-        refreshOverlay(mask, bmp.width, bmp.height)
+        // Debounced: only refresh overlay if 80 ms of quiet time elapses
+        scheduleOverlayRefresh(mask, bmp.width, bmp.height, debounceMs = 80)
+    }
+
+    /**
+     * Call this on drag END to force the final overlay render regardless of debounce.
+     */
+    fun commitBrushStroke() {
+        val state = _uiState.value
+        val mask  = state.mask ?: return
+        val bmp   = state.originalBitmap ?: return
+        refreshOverlayImmediate(mask, bmp.width, bmp.height)
     }
 
     fun smartBrush(x: Float, y: Float) {
@@ -196,9 +216,8 @@ class EditorViewModel : ViewModel() {
                 pixels, mask, original.width, original.height,
                 x, y, state.brushSize * 3f, state.smartTolerance, state.brushAdding
             )
-            withContext(Dispatchers.Main) {
-                refreshOverlay(mask, original.width, original.height)
-            }
+            // Snapshot and render overlay on the same background thread
+            renderOverlayFromSnapshot(mask.copyOf(), original.width, original.height)
         }
     }
 
@@ -208,7 +227,7 @@ class EditorViewModel : ViewModel() {
         val mask  = ByteArray(bmp.width * bmp.height)
         NativeProcessor.radialMask(mask, bmp.width, bmp.height, cx, cy, inner, outer, inverted)
         _uiState.update { it.copy(mask = mask) }
-        refreshOverlay(mask, bmp.width, bmp.height)
+        refreshOverlayImmediate(mask, bmp.width, bmp.height)
     }
 
     fun applyLinearMask(sx: Float, sy: Float, ex: Float, ey: Float) {
@@ -217,7 +236,7 @@ class EditorViewModel : ViewModel() {
         val mask  = ByteArray(bmp.width * bmp.height)
         NativeProcessor.linearGradientMask(mask, bmp.width, bmp.height, sx, sy, ex, ey)
         _uiState.update { it.copy(mask = mask) }
-        refreshOverlay(mask, bmp.width, bmp.height)
+        refreshOverlayImmediate(mask, bmp.width, bmp.height)
     }
 
     fun applyColorRangeMask(r: Int, g: Int, b: Int) {
@@ -229,9 +248,7 @@ class EditorViewModel : ViewModel() {
             original.getPixels(pixels, 0, original.width, 0, 0, original.width, original.height)
             NativeProcessor.colorRangeMask(pixels, mask, original.width, original.height, r, g, b, state.smartTolerance)
             _uiState.update { it.copy(mask = mask) }
-            withContext(Dispatchers.Main) {
-                refreshOverlay(mask, original.width, original.height)
-            }
+            renderOverlayFromSnapshot(mask.copyOf(), original.width, original.height)
         }
     }
 
@@ -239,19 +256,52 @@ class EditorViewModel : ViewModel() {
         val mask = _uiState.value.mask ?: return
         NativeProcessor.invertMask(mask)
         val bmp  = _uiState.value.originalBitmap ?: return
-        refreshOverlay(mask, bmp.width, bmp.height)
+        refreshOverlayImmediate(mask, bmp.width, bmp.height)
     }
 
     fun clearMask() {
         val mask = _uiState.value.mask ?: return
         NativeProcessor.clearMask(mask, false)
         val bmp  = _uiState.value.originalBitmap ?: return
-        refreshOverlay(mask, bmp.width, bmp.height)
+        refreshOverlayImmediate(mask, bmp.width, bmp.height)
     }
 
-    private fun refreshOverlay(mask: ByteArray, w: Int, h: Int) {
-        viewModelScope.launch(Dispatchers.Default) {
-            val pixels  = NativeProcessor.getMaskOverlay(mask, w, h)
+    // ── Overlay rendering helpers ─────────────────────────────────────────
+
+    /**
+     * Debounced overlay refresh for rapid brush events.
+     * Cancels any pending overlay job; only fires after [debounceMs] of silence.
+     * Takes a SNAPSHOT of the mask at the scheduled execution time to avoid
+     * read/write races with concurrent paintMask calls.
+     */
+    private fun scheduleOverlayRefresh(mask: ByteArray, w: Int, h: Int, debounceMs: Long) {
+        overlayJob?.cancel()
+        overlayJob = viewModelScope.launch {
+            delay(debounceMs)
+            // Take snapshot AFTER the delay — captures the latest painted state
+            val snapshot = mask.copyOf()
+            renderOverlayFromSnapshot(snapshot, w, h)
+        }
+    }
+
+    /**
+     * Immediate overlay refresh — cancels debounce, renders right away.
+     * Always takes a snapshot to avoid reading a mask that paintMask is writing.
+     */
+    private fun refreshOverlayImmediate(mask: ByteArray, w: Int, h: Int) {
+        overlayJob?.cancel()
+        val snapshot = mask.copyOf()
+        overlayJob = viewModelScope.launch(Dispatchers.Default) {
+            renderOverlayFromSnapshot(snapshot, w, h)
+        }
+    }
+
+    /**
+     * Core render — always receives an immutable snapshot, safe to call from any thread.
+     */
+    private suspend fun renderOverlayFromSnapshot(snapshot: ByteArray, w: Int, h: Int) {
+        withContext(Dispatchers.Default) {
+            val pixels  = NativeProcessor.getMaskOverlay(snapshot, w, h)
             val overlay = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
             _uiState.update { cur -> cur.copy(overlayBitmap = overlay) }
         }
@@ -259,11 +309,11 @@ class EditorViewModel : ViewModel() {
 
     // ── Brush settings ────────────────────────────────────────────────────
 
-    fun setBrushSize(size: Float)      = _uiState.update { it.copy(brushSize    = size) }
-    fun setBrushAdding(adding: Boolean)= _uiState.update { it.copy(brushAdding  = adding) }
-    fun setMaskMode(mode: MaskMode)    = _uiState.update { it.copy(maskMode     = mode) }
-    fun setSmartTolerance(t: Float)    = _uiState.update { it.copy(smartTolerance = t) }
-    fun setActiveTab(tab: EditorTab)   = _uiState.update { it.copy(activeTab    = tab) }
+    fun setBrushSize(size: Float)       = _uiState.update { it.copy(brushSize     = size) }
+    fun setBrushAdding(adding: Boolean) = _uiState.update { it.copy(brushAdding   = adding) }
+    fun setMaskMode(mode: MaskMode)     = _uiState.update { it.copy(maskMode      = mode) }
+    fun setSmartTolerance(t: Float)     = _uiState.update { it.copy(smartTolerance = t) }
+    fun setActiveTab(tab: EditorTab)    = _uiState.update { it.copy(activeTab     = tab) }
 
     // ── Export ────────────────────────────────────────────────────────────
 
@@ -295,7 +345,7 @@ class EditorViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        // Only safe to recycle here — ViewModel is being destroyed, no UI holds references
+        // Safe to recycle here — ViewModel destroyed, no UI holds references
         _uiState.value.let { s ->
             s.displayBitmap?.recycle()
             s.originalBitmap?.recycle()
